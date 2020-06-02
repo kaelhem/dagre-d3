@@ -129,13 +129,17 @@ function createClusters(selection, g) {
   util.applyTransition(svgClusters, g)
     .style("opacity", 1);
 
+  var itemQueue = [];
   svgClusters.each(function(v) {
     var node = g.node(v);
     var thisGroup = d3.select(this);
     d3.select(this).append("rect");
     var labelGroup = thisGroup.append("g").attr("class", "label");
-    addLabel(labelGroup, node, node.clusterLabelPos);
+    itemQueue.push(addLabel.createLabel(labelGroup, node, node.clusterLabelPos));
+    //addLabel(labelGroup, node, node.clusterLabelPos);
   });
+
+  addLabel.styleLabels(itemQueue);
 
   svgClusters.selectAll("rect").each(function(c) {
     var node = g.node(c);
@@ -178,14 +182,31 @@ function createEdgeLabels(selection, g) {
     .classed("edgeLabel", true)
     .style("opacity", 0);
 
+  var itemQueue = [];
+  var labelQueue = [];
+
   svgEdgeLabels = selection.selectAll("g.edgeLabel");
 
   svgEdgeLabels.each(function(e) {
     var root = d3.select(this);
     root.select(".label").remove();
     var edge = g.edge(e);
-    var label = addLabel(root, g.edge(e), 0, 0).classed("label", true);
-    var bbox = label.node().getBBox();
+    var label = addLabel.createLabel(root, g.edge(e), 0, 0);
+    label.labelSvg.classed("label", true);
+    labelQueue.push(label);
+    itemQueue.push({edge: edge, label: label.labelSvg});
+  });
+
+  addLabel.styleLabels(labelQueue);
+
+  itemQueue.forEach(function(item) {
+    item.bbox = item.label.node().getBBox();
+  });
+
+  itemQueue.forEach(function(item) {
+    var label = item.label;
+    var edge = item.edge;
+    var bbox = item.bbox;
 
     if (edge.labelId) { label.attr("id", edge.labelId); }
     if (!_.has(edge, "width")) { edge.width = bbox.width; }
@@ -309,14 +330,23 @@ function enter(svgPaths, g) {
   var svgPathsEnter = svgPaths.enter().append("g")
     .attr("class", "edgePath")
     .style("opacity", 0);
-  svgPathsEnter.append("path")
-    .attr("class", "path")
-    .attr("d", function(e) {
-      var edge = g.edge(e);
-      var sourceElem = g.node(e.v).elem;
-      var points = _.range(edge.points.length).map(function() { return getCoords(sourceElem); });
-      return createLine(edge, points);
-    });
+
+  var s = svgPathsEnter.append("path")
+    .attr("class", "path");
+  var stashed = [];
+  s.data().map(function(e) {
+    var edge = g.edge(e),
+      sourceElem = g.node(e.v).elem,
+      points = _.range(edge.points.length).map(function() { return getCoords(sourceElem); });
+    stashed.push({el: e, edge: edge, points: points});
+  });
+  s.attr("d", function(e, i) {
+    var specs = stashed[i];
+    if (!specs) {
+      return;
+    }
+    return createLine(specs.edge, specs.points);
+  });
   svgPathsEnter.append("defs");
   return svgPathsEnter;
 }
@@ -350,6 +380,11 @@ function createNodes(selection, g, shapes) {
     .attr("class", "node")
     .style("opacity", 0);
 
+  // create queue for batch processing
+  // batch reading from then writing to DOM for increased performance
+  var itemQueue = [];
+  var labelQueue = [];
+
   svgNodes = selection.selectAll("g.node"); 
 
   svgNodes.each(function(v) {
@@ -360,11 +395,31 @@ function createNodes(selection, g, shapes) {
 
     thisGroup.select("g.label").remove();
     var labelGroup = thisGroup.append("g").attr("class", "label");
-    var labelDom = addLabel(labelGroup, node);
-    var shape = shapes[node.shape];
-    var bbox = _.pick(labelDom.node().getBBox(), "width", "height");
+    var label = addLabel.createLabel(labelGroup, node);
+    var labelDom = label.labelSvg;
 
-    node.elem = this;
+    labelQueue.push(label);
+
+    // add to queue for further processing
+    itemQueue.push({self: this, node: node, thisGroup: thisGroup, labelGroup: labelGroup, labelDom: labelDom});
+  });
+
+  addLabel.styleLabels(labelQueue);
+
+  // get bounding box for each label
+  itemQueue.forEach(function(item) {
+    item.bbox = _.pick(item.labelDom.node().getBBox(), "width", "height");
+  });
+
+  // apply styles with bbox info
+  itemQueue.forEach(function(item) {
+    var node = item.node,
+      thisGroup = item.thisGroup,
+      labelGroup = item.labelGroup,
+      self = item.self,
+      bbox = item.bbox;
+    var shape = shapes[node.shape];
+    node.elem = self;
 
     if (node.id) { thisGroup.attr("id", node.id); }
     if (node.labelId) { labelGroup.attr("id", node.labelId); }
@@ -378,14 +433,23 @@ function createNodes(selection, g, shapes) {
       ((node.paddingLeft - node.paddingRight) / 2) + "," +
       ((node.paddingTop - node.paddingBottom) / 2) + ")");
 
-    var root = d3.select(this);
+    var root = d3.select(self);
     root.select(".label-container").remove();
-    var shapeSvg = shape(root, bbox, node).classed("label-container", true);
-    util.applyStyle(shapeSvg, node.style);
+    item.shapeSvg = shape(root, bbox, node);
+    item.shapeSvg.classed("label-container", true);
+  });
 
-    var shapeBBox = shapeSvg.node().getBBox();
-    node.width = shapeBBox.width;
-    node.height = shapeBBox.height;
+  itemQueue.forEach(function(item) {
+    util.applyStyle(item.shapeSvg, item.node.style);
+  });
+
+  itemQueue.forEach(function(item) {
+    item.shapeBBox = item.shapeSvg.node().getBBox();
+  });
+
+  itemQueue.forEach(function(item) {
+    item.node.width = item.shapeBBox.width;
+    item.node.height = item.shapeBBox.height;
   });
 
   var exitSelection;
@@ -425,6 +489,7 @@ if (!d3) {
 module.exports = d3;
 
 },{"d3":60}],8:[function(require,module,exports){
+// eslint-disable-next-line no-redeclare
 /* global window */
 
 var dagre;
@@ -444,6 +509,7 @@ if (!dagre) {
 module.exports = dagre;
 
 },{"dagre":61}],9:[function(require,module,exports){
+// eslint-disable-next-line no-redeclare
 /* global window */
 
 var graphlib;
@@ -724,9 +790,9 @@ var addTextLabel = require("./add-text-label");
 var addHtmlLabel = require("./add-html-label");
 var addSVGLabel  = require("./add-svg-label");
 
-module.exports = addLabel;
+//module.exports = addLabel;
 
-function addLabel(root, node, location) {
+function createLabel(root, node, location) {
   var label = node.label;
   var labelSvg = root.append("g");
 
@@ -739,8 +805,18 @@ function addLabel(root, node, location) {
   } else {
     addTextLabel(labelSvg, node);
   }
+  return {labelSvg: labelSvg, node: node, location: location};
+}
 
-  var labelBBox = labelSvg.node().getBBox();
+function getLabelBBox(item) {
+  item.labelBBox = item.labelSvg.node().getBBox();
+}
+
+function finishStyling(item) {
+  var node = item.node;
+  var labelSvg = item.labelSvg;
+  var labelBBox = item.labelBBox;
+  var location = item.location;
   var y;
   switch(location) {
   case "top":
@@ -758,6 +834,16 @@ function addLabel(root, node, location) {
 
   return labelSvg;
 }
+
+function styleLabels(items) {
+  items.forEach(getLabelBBox);
+  return items.map(finishStyling);
+}
+
+module.exports.createLabel = createLabel;
+module.exports.getLabelBBox = getLabelBBox;
+module.exports.finishStyling = finishStyling;
+module.exports.styleLabels = styleLabels;
 
 },{"./add-html-label":17,"./add-svg-label":19,"./add-text-label":20}],19:[function(require,module,exports){
 var util = require("../util");
@@ -821,6 +907,7 @@ function processEscapeSequences(text) {
 }
 
 },{"../util":27}],21:[function(require,module,exports){
+// eslint-disable-next-line no-redeclare
 /* global window */
 
 var lodash;
@@ -1241,7 +1328,7 @@ function applyTransition(selection, g) {
 }
 
 },{"./lodash":21}],28:[function(require,module,exports){
-module.exports = "0.6.4";
+module.exports = "0.6.5-pre";
 
 },{}],29:[function(require,module,exports){
 // https://d3js.org/d3-array/ v1.2.4 Copyright 2018 Mike Bostock
@@ -5720,7 +5807,7 @@ Object.defineProperty(exports, '__esModule', { value: true });
 })));
 
 },{"d3-collection":33,"d3-dispatch":36,"d3-quadtree":48,"d3-timer":56}],42:[function(require,module,exports){
-// https://d3js.org/d3-format/ v1.4.2 Copyright 2019 Mike Bostock
+// https://d3js.org/d3-format/ v1.4.3 Copyright 2019 Mike Bostock
 (function (global, factory) {
 typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
 typeof define === 'function' && define.amd ? define(['exports'], factory) :
@@ -5827,7 +5914,7 @@ function formatTrim(s) {
     switch (s[i]) {
       case ".": i0 = i1 = i; break;
       case "0": if (i0 === 0) i0 = i; i1 = i; break;
-      default: if (i0 > 0) { if (!+s[i]) break out; i0 = 0; } break;
+      default: if (!+s[i]) break out; if (i0 > 0) i0 = 0; break;
     }
   }
   return i0 > 0 ? s.slice(0, i0) + s.slice(i1 + 1) : s;
@@ -16540,7 +16627,7 @@ Object.defineProperty(exports, '__esModule', { value: true });
 }));
 
 },{"d3-path":46}],54:[function(require,module,exports){
-// https://d3js.org/d3-time-format/ v2.2.2 Copyright 2019 Mike Bostock
+// https://d3js.org/d3-time-format/ v2.2.3 Copyright 2019 Mike Bostock
 (function (global, factory) {
 typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('d3-time')) :
 typeof define === 'function' && define.amd ? define(['exports', 'd3-time'], factory) :
@@ -20193,7 +20280,7 @@ var d3Transition = require('d3-transition');
 var d3Voronoi = require('d3-voronoi');
 var d3Zoom = require('d3-zoom');
 
-var version = "5.14.2";
+var version = "5.15.0";
 
 Object.keys(d3Array).forEach(function (k) {
 	if (k !== 'default') Object.defineProperty(exports, k, {
